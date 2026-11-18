@@ -78,6 +78,28 @@ Currently supported data sources:
 3. valid credentials (offline) - can decrypt masterkey files by letting you type in the correct SID and password.
 4. `pls don't integrate this part to your project, it's beta`
 
+Plaintext masterkeys can be loaded from the JSON produced by the `masterkey`,
+`masterkeypvk` or `minidump` commands. Both user and SYSTEM masterkeys are
+supported; matching keys are selected by the DPAPI blob's masterkey GUID, with
+the blob's `CRYPTPROTECT_SYSTEM` flag used as a scope hint. Backup keys and raw
+hex masterkeys are also accepted.
+
+Decrypt a raw DPAPI blob (binary file, hex file or hex string):
+```
+pypykatz dpapi blob masterkeys.json blob.bin --json
+```
+
+Decrypt Chrome's `Local State` and, optionally, its Login Data and Cookies:
+```
+pypykatz dpapi chrome masterkeys.json "Local State" --logindata "Login Data" --cookies Cookies --json
+```
+
+The Local State output is JSON with the original structure preserved and the
+plaintext key added as `os_crypt.decrypted_key` (hex), plus
+`os_crypt.decrypted_key_b64`. Chrome `v10` and `v11` AES-GCM secrets are
+decrypted with that key; older direct-DPAPI values are decrypted separately.
+App-Bound Encryption (`v20`) is not supported.
+
 ### Impersonating users
 Can spawn a new process as any user who has a process running on the machine.  
 Can assign any available token of choise to your thread  

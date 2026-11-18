@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid26315",
+  "B": "/home/dev/feedback/uid26315",
+  "sha": "193e67dbb2aa22c7ec1fcac32f16af3c863a8596",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "skelsec",
+    "repo": "pypykatz",
+    "sha": "193e67dbb2aa22c7ec1fcac32f16af3c863a8596"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "pypykatz",
+    "cloneUrl": "https://github.com/Rrr119/pypykatz.git"
+  },
+  "at": "2026-11-18T16:13:46.428Z"
+}

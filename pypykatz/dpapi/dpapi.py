@@ -16,6 +16,7 @@ import glob
 import sqlite3
 import base64
 import platform
+import re
 from hashlib import sha1, pbkdf2_hmac, sha512
 
 import xml.etree.ElementTree as ET
@@ -24,7 +25,9 @@ from pypykatz import logger
 from pypykatz.dpapi.structures.masterkeyfile import MasterKeyFile
 from pypykatz.dpapi.structures.credentialfile import CredentialFile, CREDENTIAL_BLOB
 from pypykatz.dpapi.structures.blob import DPAPI_BLOB
+from pypykatz.dpapi.structures.chromelocalstate import ChromeLocalState
 from pypykatz.dpapi.structures.vault import VAULT_VCRD, VAULT_VPOL, VAULT_VPOL_KEYS
+from pypykatz.dpapi.constants import FLAGS
 from pypykatz.dpapi.finders.ngc import NGCProtectorFinder, NGCProtector
 from pypykatz.dpapi.finders.cryptokeys import CryptoKeysFinder
 
@@ -109,6 +112,9 @@ class DPAPI:
 		#masterkey, backupkey
 		self.masterkeys = {} #guid -> binary value
 		self.backupkeys = {} #guid -> binary value
+		self.masterkeys_by_scope = {'user': {}, 'system': {}}
+		self.backupkeys_by_scope = {'user': {}, 'system': {}}
+		self.unbound_masterkeys = []
 		
 		#since so far I dunno how to match vault-keys to vaults, its a list :(
 		self.vault_keys = []
@@ -156,15 +162,151 @@ class DPAPI:
 				t = { 'masterkeys' : self.masterkeys, 'backupkeys': self.backupkeys}
 				f.write(json.dumps(t, cls = UniversalEncoder, indent=4, sort_keys=True))
 
-	def load_masterkeys(self, filename):
-		with open(filename, 'r') as f:
-			data = json.loads(f.read())
-		
+	@staticmethod
+	def _normalize_scope(scope):
+		if scope is None:
+			return 'user'
+		scope = str(scope).lower()
+		if scope in ('machine', 'local_machine', 'localmachine', 's-1-5-18'):
+			scope = 'system'
+		if scope not in ('user', 'system'):
+			raise ValueError('Unknown masterkey scope: %s' % scope)
+		return scope
 
-		for guid in data['backupkeys']:
-			self.backupkeys[guid] = bytes.fromhex(data['backupkeys'][guid])
-		for guid in data['masterkeys']:
-			self.masterkeys[guid] = bytes.fromhex(data['masterkeys'][guid])
+	@staticmethod
+	def _normalize_guid(guid):
+		return str(guid).strip().strip('{}').lower()
+
+	def add_masterkey(self, key_guid, key, scope = 'user', backup = False):
+		"""
+		Adds a plaintext masterkey without changing the legacy masterkeys /
+		backupkeys dictionaries.
+
+		key_guid: masterkey GUID
+		key: plaintext masterkey bytes (or hex string)
+		scope: 'user' or 'system'
+		backup: set to True for a backup key
+		"""
+		if isinstance(key, str):
+			key = bytes.fromhex(key)
+		if not isinstance(key, (bytes, bytearray)):
+			raise TypeError('Masterkey must be bytes or a hex string')
+		key = bytes(key)
+		if len(key) == 0:
+			raise ValueError('Masterkey must not be empty')
+
+		guid = DPAPI._normalize_guid(key_guid)
+		scope = DPAPI._normalize_scope(scope)
+
+		keys = self.backupkeys if backup else self.masterkeys
+		scoped_keys = self.backupkeys_by_scope if backup else self.masterkeys_by_scope
+		keys[guid] = key
+		scoped_keys[scope][guid] = key
+		return key
+
+	def add_user_masterkey(self, key_guid, key, backup = False):
+		return self.add_masterkey(key_guid, key, scope = 'user', backup = backup)
+
+	def add_system_masterkey(self, key_guid, key, backup = False):
+		return self.add_masterkey(key_guid, key, scope = 'system', backup = backup)
+
+	def add_unbound_masterkey(self, key):
+		"""
+		Adds a masterkey whose GUID is unknown. It is only tried after a blob
+		GUID lookup fails.
+		"""
+		if isinstance(key, str):
+			key = bytes.fromhex(key)
+		key = bytes(key)
+		if key not in self.unbound_masterkeys:
+			self.unbound_masterkeys.append(key)
+		return key
+
+	def load_masterkeys(self, filename):
+		"""
+		Loads masterkeys from pypykatz's JSON output, text output or a raw hex
+		masterkey. Text output lines in the form
+		"[GUID] <guid> [MASTERKEY] <hex>" are supported as well.
+		"""
+		try:
+			with open(filename, 'rb') as f:
+				raw_data = f.read()
+		except (OSError, TypeError):
+			raw_data = str(filename).encode('utf-8')
+
+		try:
+			data = json.loads(raw_data.decode('utf-8-sig'))
+		except Exception:
+			data = None
+
+		if isinstance(data, dict):
+			self._load_masterkeys_from_json(data)
+			return
+
+		text = raw_data.decode('utf-8', errors = 'ignore').strip()
+		found = False
+		pattern = re.compile(
+			r'\[GUID\]\s*(?P<guid>[0-9a-fA-F-]{36})\s+\[(?P<type>MASTERKEY|BACKUPKEY)\]\s*(?P<key>[0-9a-fA-F]+)'
+		)
+		for match in pattern.finditer(text):
+			self.add_masterkey(
+				match.group('guid'),
+				match.group('key'),
+				backup = match.group('type') == 'BACKUPKEY'
+			)
+			found = True
+
+		if not found:
+			for line in text.splitlines():
+				line = line.strip()
+				if line == '':
+					continue
+				try:
+					key = bytes.fromhex(line)
+				except ValueError:
+					continue
+				self.add_unbound_masterkey(key)
+				found = True
+
+		if not found:
+			raise ValueError('Failed to parse masterkey data from %s' % filename)
+
+	def _load_masterkeys_from_json(self, data):
+		found = False
+		for section, backup in (
+			('masterkeys', False),
+			('backupkeys', True),
+			('user_masterkeys', False),
+			('system_masterkeys', False),
+			('user_backupkeys', True),
+			('system_backupkeys', True),
+		):
+			keys = data.get(section)
+			if not isinstance(keys, dict):
+				continue
+			found = True
+
+			scope = 'user'
+			if section.startswith('system_'):
+				scope = 'system'
+			for guid, key in keys.items():
+				self.add_masterkey(guid, key, scope = scope, backup = backup)
+
+		scopes = data.get('masterkey_scopes') or data.get('scopes')
+		if isinstance(scopes, dict):
+			for section, backup in (('masterkeys', False), ('backupkeys', True)):
+				keys = data.get(section)
+				if not isinstance(keys, dict):
+					continue
+				for guid, key in keys.items():
+					key_scopes = scopes.get(guid, ['user'])
+					if isinstance(key_scopes, str):
+						key_scopes = [key_scopes]
+					for scope in key_scopes:
+						self.add_masterkey(guid, key, scope = scope, backup = backup)
+
+		if not found:
+			raise ValueError('No masterkeys or backupkeys found in JSON data')
 
 		
 	def get_prekeys_from_password(self, sid, password = None, nt_hash = None, sha1_hash=None):
@@ -371,10 +513,10 @@ class DPAPI:
 		privkey = PVKFile.from_file(pvkfile).get_key()
 		decdk = privkey.decrypt(dk[::-1], PKCS1v15())
 		secret = decdk[8:72] # TODO: proper file format would be good here!!!
-		self.masterkeys[mkf.guid] = secret
+		self.add_masterkey(mkf.guid, secret, scope = 'user')
 		return self.masterkeys
 			
-	def decrypt_masterkey_file(self, file_path, key = None):
+	def decrypt_masterkey_file(self, file_path, key = None, scope = 'user'):
 		"""
 		Decrypts Masterkeyfile
 		file_path: path to Masterkeyfile
@@ -382,9 +524,9 @@ class DPAPI:
 		returns: CREDENTIAL_BLOB object
 		"""
 		with open(file_path, 'rb') as f:
-			mks, bks = self.decrypt_masterkey_bytes(f.read(), key = key)
+			mks, bks = self.decrypt_masterkey_bytes(f.read(), key = key, scope = scope)
 			self.masterkeys.update(mks)
-			self.masterkeys.update(bks)
+			self.backupkeys.update(bks)
 			return mks, bks
 		
 	def decrypt_masterkey_directory(self, directory, ignore_errors: bool = True):
@@ -397,14 +539,20 @@ class DPAPI:
 		for filename in glob.glob(os.path.join(directory, '**'), recursive = True):
 			if os.path.isfile(filename):
 				try:
-					self.decrypt_masterkey_file(filename)
+					normalized = filename.replace('\\', '/').lower()
+					scope = 'system' if (
+						'/s-1-5-18/' in normalized
+						or '/serviceprofiles/' in normalized
+						or '/windows/system32/' in normalized
+					) else 'user'
+					self.decrypt_masterkey_file(filename, scope = scope)
 				except Exception as e:
 					if ignore_errors is False:
 						raise e
 					logger.debug('Failed to decrypt %s Reason: %s' % (filename, e))
 		return self.masterkeys
 	
-	def decrypt_masterkey_bytes(self, data, key = None):
+	def decrypt_masterkey_bytes(self, data, key = None, scope = 'user'):
 		"""
 		Decrypts Masterkeyfile bytes
 		data: bytearray of the masterkeyfile
@@ -417,40 +565,40 @@ class DPAPI:
 		if mkf.masterkey is not None:
 			if mkf.guid in self.masterkeys:
 				mks[mkf.guid] = self.masterkeys[mkf.guid]
-				
+
 			else:
 				for user_key in self.prekeys:
 					dec_key = mkf.masterkey.decrypt(user_key)
 					if dec_key:
 						logger.debug('user key win: %s' % user_key.hex())
-						self.masterkeys[mkf.guid] = dec_key
+						self.add_masterkey(mkf.guid, dec_key, scope = scope)
 						mks[mkf.guid] = dec_key
 						break
-						
+
 				if key is not None:
 					dec_key = mkf.masterkey.decrypt(key)
 					if dec_key:
-						self.masterkeys[mkf.guid] = dec_key
+						self.add_masterkey(mkf.guid, dec_key, scope = scope)
 						mks[mkf.guid] = dec_key
-		
+
 		if mkf.backupkey is not None:
-			if mkf.guid in self.masterkeys:
-				mks[mkf.guid] = self.masterkeys[mkf.guid]
-				
+			if mkf.guid in self.backupkeys:
+				bks[mkf.guid] = self.backupkeys[mkf.guid]
+
 			else:
 				for user_key in self.prekeys:
 					dec_key = mkf.backupkey.decrypt(user_key)
 					if dec_key:
-						self.backupkeys[mkf.guid] = dec_key
+						self.add_masterkey(mkf.guid, dec_key, scope = scope, backup = True)
 						bks[mkf.guid] = dec_key
 						break
-						
+
 				if key is not None:
 					dec_key = mkf.backupkey.decrypt(key)
 					if dec_key:
-						self.masterkeys[mkf.guid] = dec_key
+						self.add_masterkey(mkf.guid, dec_key, scope = scope, backup = True)
 						bks[mkf.guid] = dec_key
-					
+
 		return mks, bks
 	
 	def decrypt_credential_file(self, file_path):
@@ -462,15 +610,56 @@ class DPAPI:
 		with open(file_path, 'rb') as f:
 			return self.decrypt_credential_bytes(f.read())
 		
-	def get_key_for_blob(self, blob):
+	def get_key_candidates_for_blob(self, blob):
+		"""
+		Returns all cached keys matching the blob's GUID, ordered by the scope
+		specified in the blob flags. User and system keys can therefore share a
+		GUID without one hiding the other.
+		"""
+		guid = DPAPI._normalize_guid(blob.masterkey_guid)
+		system_blob = bool(blob.flags & FLAGS.CRYPTPROTECT_SYSTEM)
+		preferred_scope = 'system' if system_blob else 'user'
+		other_scope = 'user' if preferred_scope == 'system' else 'system'
+		candidates = []
+		seen = set()
+
+		def add(key, scope):
+			if key in seen:
+				return
+			seen.add(key)
+			candidates.append((key, scope))
+
+		for scope in (preferred_scope, other_scope):
+			if guid in self.masterkeys_by_scope[scope]:
+				add(self.masterkeys_by_scope[scope][guid], scope)
+
+		if guid in self.masterkeys:
+			add(self.masterkeys[guid], None)
+
+		for scope in (preferred_scope, other_scope):
+			if guid in self.backupkeys_by_scope[scope]:
+				add(self.backupkeys_by_scope[scope][guid], scope + '_backup')
+
+		if guid in self.backupkeys:
+			add(self.backupkeys[guid], 'backup')
+
+		return candidates
+
+	def get_key_for_blob(self, blob, return_scope = False):
 		"""
 		Looks up the masterkey for a given DPAPI_BLOB object
 		blob: DPAPI_BLOB object
 		returns: bytes of the decryption key
 		"""
-		if blob.masterkey_guid not in self.masterkeys:
-			raise Exception('No matching masterkey was found for the blob!')
-		return self.masterkeys[blob.masterkey_guid]
+		candidates = self.get_key_candidates_for_blob(blob)
+		if len(candidates) > 0:
+			key, scope = candidates[0]
+			return (key, scope) if return_scope else key
+
+		raise Exception(
+			'No matching masterkey was found for the blob! Looking for GUID %s'
+			% DPAPI._normalize_guid(blob.masterkey_guid)
+		)
 	
 	def decrypt_credential_bytes(self, data, entropy = None):
 		"""
@@ -497,9 +686,18 @@ class DPAPI:
 		"""
 		if key is None:
 			logger.debug('[DPAPI] Looking for master key with GUID %s' % dpapi_blob.masterkey_guid)
-			if dpapi_blob.masterkey_guid not in self.masterkeys:
-				raise Exception('No matching masterkey was found for the blob! Looking for GUID %s' % dpapi_blob.masterkey_guid)
-			key = self.masterkeys[dpapi_blob.masterkey_guid]
+			candidates = [x[0] for x in self.get_key_candidates_for_blob(dpapi_blob)]
+			candidates.extend(self.unbound_masterkeys)
+			if len(candidates) == 0:
+				raise Exception(
+					'No matching masterkey was found for the blob! Looking for GUID %s'
+					% dpapi_blob.masterkey_guid
+				)
+			for candidate in candidates:
+				plaintext = dpapi_blob.decrypt(candidate, entropy = entropy)
+				if plaintext is not None:
+					return plaintext
+			return None
 		return dpapi_blob.decrypt(key, entropy = entropy)
 		
 	def decrypt_blob_bytes(self, data, key = None, entropy = None):
@@ -516,6 +714,13 @@ class DPAPI:
 		blob = DPAPI_BLOB.from_bytes(data)
 		logger.debug(str(blob))
 		return self.decrypt_blob(blob, key = key, entropy = entropy)
+
+	def decrypt_blob_hex(self, hex_str, key = None, entropy = None):
+		return self.decrypt_blob_bytes(bytes.fromhex(hex_str), key = key, entropy = entropy)
+
+	def decrypt_blob_file(self, file_path, key = None, entropy = None):
+		with open(file_path, 'rb') as f:
+			return self.decrypt_blob_bytes(f.read(), key = key, entropy = entropy)
 		
 	def decrypt_vcrd_file(self, file_path):
 		r"""
@@ -605,9 +810,29 @@ class DPAPI:
 		return self.decrypt_securestring_bytes(bytes.fromhex(hex_str))
 	
 	def decrypt_securestring_file(self, file_path):
-		with open(file_path, 'r') as f:
+		with open(file_path, 'rb') as f:
 			data = f.read()
-		return self.decrypt_securestring_hex(data)
+		try:
+			data = bytes.fromhex(data.decode('ascii').strip())
+		except Exception:
+			pass
+		return self.decrypt_securestring_bytes(data)
+
+	def decrypt_chrome_local_state_bytes(self, data, key = None):
+		state = ChromeLocalState.from_bytes(data)
+		state.decrypt(self, key = key)
+		return state.to_dict()
+
+	def decrypt_chrome_local_state_hex(self, hex_str, key = None):
+		return self.decrypt_chrome_local_state_bytes(bytes.fromhex(hex_str), key = key)
+
+	def decrypt_chrome_local_state_file(self, file_path, key = None):
+		state = ChromeLocalState.from_file(file_path)
+		state.decrypt(self, key = key)
+		return state.to_dict()
+
+	def decrypt_chrome_local_state(self, file_path, key = None):
+		return self.decrypt_chrome_local_state_file(file_path, key = key)
 		
 	
 	@staticmethod
@@ -747,58 +972,87 @@ class DPAPI:
 	def decrypt_all_chrome_live(self):
 		dbpaths = DPAPI.find_chrome_database_file_live()
 		return self.decrypt_all_chrome(dbpaths)
-		
-		
+
+	@staticmethod
+	def _decrypt_chrome_aead(encrypted_value, key):
+		if not isinstance(encrypted_value, (bytes, bytearray)):
+			encrypted_value = bytes(encrypted_value)
+		if len(encrypted_value) < 31:
+			raise ValueError('Chrome v10/v11 value is too short')
+
+		nonce = encrypted_value[3:15]
+		ciphertext = encrypted_value[15:-16]
+		tag = encrypted_value[-16:]
+		cipher = AES(key, MODE_GCM, IV = nonce, segment_size = 16)
+		return cipher.decrypt(ciphertext, b'', tag)
+
+	def _decrypt_chrome_value(self, encrypted_value, localstate_key = None):
+		if encrypted_value is None:
+			return None
+		if not isinstance(encrypted_value, (bytes, bytearray)):
+			encrypted_value = bytes(encrypted_value)
+		if len(encrypted_value) == 0:
+			return None
+
+		if encrypted_value.startswith((b'v10', b'v11')):
+			if localstate_key is None:
+				raise ValueError('Chrome Local State key is required for v10/v11 values')
+			return DPAPI._decrypt_chrome_aead(encrypted_value, localstate_key)
+		if encrypted_value.startswith(b'v20'):
+			raise ValueError('Chrome v20 App-Bound Encryption is not supported')
+
+		return self.decrypt_blob_bytes(encrypted_value)
+
 	def decrypt_all_chrome(self, dbpaths, throw = False):
 		results = {}
 		results['logins'] = []
 		results['cookies'] = []
 		results['fmtcookies'] = []
-		localstate_dec = None
+		results['localstate'] = {}
+		results['errors'] = []
 
 		for username in dbpaths:
+			localstate_dec = None
 			if 'localstate' in dbpaths[username]:
-				with open(dbpaths[username]['localstate'], 'r') as f:
-					encrypted_key = json.load(f)['os_crypt']['encrypted_key']
-					encrypted_key = base64.b64decode(encrypted_key)
-				
+				localstate_path = dbpaths[username]['localstate']
 				try:
-					localstate_dec = self.decrypt_blob_bytes(encrypted_key[5:])
-				except:
+					state = ChromeLocalState.from_file(localstate_path)
+					localstate_dec = state.decrypt(self)
+					results['localstate'][localstate_path] = state.to_dict()
+				except Exception as e:
 					if throw is True:
-						raise Exception('LocalState decryption failed!')
-					# this localstate was encrypted for another user...
-					continue
+						raise Exception('LocalState decryption failed: %s' % e)
+					results['errors'].append(('localstate', localstate_path, str(e)))
+					logger.debug('LocalState decryption failed for %s: %s' % (localstate_path, e))
+
 			if 'cookies' in dbpaths[username]:
 				secrets = DPAPI.get_chrome_encrypted_secret(dbpaths[username]['cookies'], 'cookies')
 				for host_key, name, path, encrypted_value in secrets['cookies']:
-					if encrypted_value.startswith(b'v10'):
-						nonce = encrypted_value[3:3+12]
-						ciphertext = encrypted_value[3+12:-16]
-						tag = encrypted_value[-16:]
-						cipher = AES(localstate_dec, MODE_GCM, IV=nonce, segment_size = 16)
-						dec_val = cipher.decrypt(ciphertext, b'', tag)
+					try:
+						dec_val = self._decrypt_chrome_value(encrypted_value, localstate_dec)
+						if dec_val is None:
+							continue
 						results['cookies'].append((dbpaths[username]['cookies'], host_key, name, path, dec_val ))
 						results['fmtcookies'].append(DPAPI.cookieformatter('https://' + host_key, name, path, dec_val))
-					elif encrypted_value:
-						dec_val = self.decrypt_blob_bytes(encrypted_value)
-						results['cookies'].append((dbpaths[username]['cookies'], host_key, name, path, dec_val ))
-						results['fmtcookies'].append(DPAPI.cookieformatter('https://' + host_key, name, path, dec_val))
+					except Exception as e:
+						if throw is True:
+							raise
+						results['errors'].append(('cookies', dbpaths[username]['cookies'], str(e)))
+						logger.debug('Failed to decrypt Chrome cookie from %s: %s' % (dbpaths[username]['cookies'], e))
 
 			if 'logindata' in dbpaths[username]:
 				secrets = DPAPI.get_chrome_encrypted_secret(dbpaths[username]['logindata'], 'logindata')
 				for url, user, enc_password in secrets['logins']:
-					if enc_password.startswith(b'v10'):
-						nonce = enc_password[3:3+12]
-						ciphertext = enc_password[3+12:-16]
-						tag = enc_password[-16:]
-						cipher = AES(localstate_dec, MODE_GCM, IV=nonce, segment_size = 16)
-						password = cipher.decrypt(ciphertext, b'', tag)
+					try:
+						password = self._decrypt_chrome_value(enc_password, localstate_dec)
+						if password is None:
+							continue
 						results['logins'].append((dbpaths[username]['logindata'], url, user, password))
-					
-					else:
-						password = self.decrypt_blob_bytes(enc_password)
-						results['logins'].append((dbpaths[username]['logindata'], url, user, password))
+					except Exception as e:
+						if throw is True:
+							raise
+						results['errors'].append(('logindata', dbpaths[username]['logindata'], str(e)))
+						logger.debug('Failed to decrypt Chrome login from %s: %s' % (dbpaths[username]['logindata'], e))
 				
 		return results
 		
